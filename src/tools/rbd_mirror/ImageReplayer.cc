@@ -6,6 +6,8 @@
 #include "common/errno.h"
 #include "include/stringify.h"
 #include "cls/rbd/cls_rbd_client.h"
+#include "common/Timer.h"
+#include "common/WorkQueue.h"
 #include "journal/Journaler.h"
 #include "journal/ReplayEntry.h"
 #include "journal/ReplayHandler.h"
@@ -18,6 +20,7 @@
 #include "librbd/internal.h"
 #include "librbd/journal/Replay.h"
 #include "ImageReplayer.h"
+#include "Threads.h"
 
 #define dout_subsys ceph_subsys_rbd_mirror
 #undef dout_prefix
@@ -158,15 +161,17 @@ private:
   Commands commands;
 };
 
-ImageReplayer::ImageReplayer(RadosRef local, RadosRef remote,
+ImageReplayer::ImageReplayer(Threads *threads, RadosRef local, RadosRef remote,
 			     const std::string &client_id,
+			     int64_t local_pool_id,
 			     int64_t remote_pool_id,
 			     const std::string &remote_image_id) :
+  m_threads(threads),
   m_local(local),
   m_remote(remote),
   m_client_id(client_id),
   m_remote_pool_id(remote_pool_id),
-  m_local_pool_id(-1),
+  m_local_pool_id(local_pool_id),
   m_remote_image_id(remote_image_id),
   m_lock("rbd::mirror::ImageReplayer " + stringify(remote_pool_id) + " " +
 	 remote_image_id),
@@ -183,6 +188,8 @@ ImageReplayer::ImageReplayer(RadosRef local, RadosRef remote,
 
 ImageReplayer::~ImageReplayer()
 {
+  m_threads->work_queue->drain();
+
   assert(m_local_image_ctx == nullptr);
   assert(m_local_replay == nullptr);
   assert(m_remote_journaler == nullptr);
@@ -219,9 +226,13 @@ int ImageReplayer::start(const BootstrapParams *bootstrap_params)
   }
 
   CephContext *cct = static_cast<CephContext *>(m_local->cct());
+
   commit_interval = cct->_conf->rbd_journal_commit_age;
   bool remote_journaler_initialized = false;
-  m_remote_journaler = new ::journal::Journaler(m_remote_ioctx,
+  m_remote_journaler = new ::journal::Journaler(m_threads->work_queue,
+                                                m_threads->timer,
+                                                &m_threads->timer_lock,
+                                                m_remote_ioctx,
 						remote_journal_id,
 						m_client_id, commit_interval);
   r = get_registered_client_status(&registered);
@@ -315,7 +326,7 @@ fail:
   if (m_remote_journaler) {
     if (remote_journaler_initialized) {
       m_remote_journaler->stop_replay();
-      m_remote_journaler->shutdown();
+      m_remote_journaler->shut_down();
     }
     delete m_remote_journaler;
     m_remote_journaler = nullptr;
@@ -378,7 +389,7 @@ void ImageReplayer::stop()
   m_local_ioctx.close();
 
   m_remote_journaler->stop_replay();
-  m_remote_journaler->shutdown();
+  m_remote_journaler->shut_down();
   delete m_remote_journaler;
   m_remote_journaler = nullptr;
 
@@ -521,9 +532,13 @@ int ImageReplayer::get_registered_client_status(bool *registered)
       }
       librbd::journal::MirrorPeerClientMeta &cm =
 	boost::get<librbd::journal::MirrorPeerClientMeta>(client_data.client_meta);
-      m_local_pool_id = cm.pool_id;
       m_local_image_id = cm.image_id;
-      m_snap_name = cm.snap_name;
+
+      // TODO: snap name should be transient
+      if (cm.sync_points.empty()) {
+        return -ENOENT;
+      }
+      m_snap_name = cm.sync_points.front().snap_name;
 
       dout(20) << "client found, pool_id=" << m_local_pool_id << ", image_id="
 	       << m_local_image_id << ", snap_name=" << m_snap_name << dendl;
@@ -539,27 +554,17 @@ int ImageReplayer::get_registered_client_status(bool *registered)
 
 int ImageReplayer::register_client()
 {
-  int r;
-
-  std::string local_cluster_id;
-  r = m_local->cluster_fsid(&local_cluster_id);
-  if (r < 0) {
-    derr << "error retrieving local cluster id: " << cpp_strerror(r)
-	 << dendl;
-    return r;
-  }
+  // TODO allocate snap as part of sync process
   std::string m_snap_name = ".rbd-mirror." + m_client_id;
 
-  dout(20) << "m_cluster_id=" << local_cluster_id << ", pool_id="
-	   << m_local_pool_id << ", image_id=" << m_local_image_id
-	   << ", snap_name=" << m_snap_name << dendl;
+  dout(20) << "mirror_uuid=" << m_client_id << ", "
+           << "image_id=" << m_local_image_id << ", "
+	   << "snap_name=" << m_snap_name << dendl;
 
   bufferlist client_data;
   ::encode(librbd::journal::ClientData{librbd::journal::MirrorPeerClientMeta{
-	local_cluster_id, m_local_pool_id, m_local_image_id, m_snap_name}},
-    client_data);
-
-  r = m_remote_journaler->register_client(client_data);
+    m_local_image_id, {{m_snap_name, boost::none}}}}, client_data);
+  int r = m_remote_journaler->register_client(client_data);
   if (r < 0) {
     derr << "error registering client: " << cpp_strerror(r) << dendl;
     return r;

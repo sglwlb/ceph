@@ -10,6 +10,7 @@
 #include "librbd/ImageCtx.h"
 #include "librbd/ImageState.h"
 #include "tools/rbd_mirror/ImageReplayer.h"
+#include "tools/rbd_mirror/Threads.h"
 
 #include <string>
 #include <vector>
@@ -104,6 +105,7 @@ int main(int argc, const char **argv)
 
   rbd::mirror::ImageReplayer::BootstrapParams bootstap_params(local_pool_name,
 							      image_name);
+  int64_t local_pool_id;
   int64_t remote_pool_id;
   std::string remote_image_id;
 
@@ -128,6 +130,7 @@ int main(int argc, const char **argv)
 
   rbd::mirror::RadosRef local(new librados::Rados());
   rbd::mirror::RadosRef remote(new librados::Rados());
+  rbd::mirror::Threads *threads = nullptr;
 
   int r = local->init_with_context(g_ceph_context);
   if (r < 0) {
@@ -140,6 +143,14 @@ int main(int argc, const char **argv)
     derr << "error connecting to local cluster" << dendl;
     goto cleanup;
   }
+
+  r = local->pool_lookup(local_pool_name.c_str());
+  if (r < 0) {
+    derr << "error finding local pool " << local_pool_name
+	 << ": " << cpp_strerror(r) << dendl;
+    goto cleanup;
+  }
+  local_pool_id = r;
 
   r = remote->init_with_context(g_ceph_context);
   if (r < 0) {
@@ -170,8 +181,11 @@ int main(int argc, const char **argv)
 
   dout(5) << "starting replay" << dendl;
 
-  replayer = new rbd::mirror::ImageReplayer(local, remote, client_id,
-					    remote_pool_id, remote_image_id);
+  threads = new rbd::mirror::Threads(reinterpret_cast<CephContext*>(
+    local->cct()));
+  replayer = new rbd::mirror::ImageReplayer(threads, local, remote, client_id,
+					    local_pool_id, remote_pool_id,
+					    remote_image_id);
 
   r = replayer->start(&bootstap_params);
   if (r < 0) {
@@ -198,6 +212,7 @@ int main(int argc, const char **argv)
   shutdown_async_signal_handler();
 
   delete replayer;
+  delete threads;
   g_ceph_context->put();
 
   return r < 0 ? EXIT_SUCCESS : EXIT_FAILURE;
