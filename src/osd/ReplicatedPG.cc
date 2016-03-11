@@ -3010,8 +3010,6 @@ void ReplicatedPG::execute_ctx(OpContext *ctx)
 	log_op_stats(
 	  ctx);
 
-      publish_stats_to_osd();
-
       if (m && m->wants_ondisk() && !ctx->sent_disk) {
 	// send commit.
 	MOSDOpReply *reply = ctx->reply;
@@ -8303,6 +8301,7 @@ void ReplicatedPG::eval_repop(RepGather *repop)
 	 repop->on_committed.erase(p++)) {
       (*p)();
     }
+    publish_stats_to_osd();
     // send dup commits, in order
     if (waiting_for_ondisk.count(repop->v)) {
       assert(waiting_for_ondisk.begin()->first == repop->v);
